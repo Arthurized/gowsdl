@@ -22,7 +22,10 @@ type Location struct {
 // If rawloc is URL then it should be absolute.
 // Relative file path will be converted into absolute path.
 func ParseLocation(rawloc string) (*Location, error) {
-	u, _ := url.Parse(rawloc)
+	u, err := url.Parse(rawloc)
+	if err != nil {
+		return nil, err
+	}
 	if u.Scheme != "" {
 		return &Location{u: u}, nil
 	}

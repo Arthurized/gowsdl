@@ -6,6 +6,7 @@ package gowsdl
 
 import (
 	"encoding/xml"
+	"strings"
 )
 
 const xmlschema11 = "http://www.w3.org/2001/XMLSchema"
@@ -231,6 +232,11 @@ type XSDList struct {
 type XSDUnion struct {
 	SimpleType  []*XSDSimpleType `xml:"simpleType,omitempty"`
 	MemberTypes string           `xml:"memberTypes,attr"`
+}
+
+// memberNames returns the type names listed in the union's memberTypes attribute.
+func (u XSDUnion) memberNames() []string {
+	return strings.Fields(u.MemberTypes)
 }
 
 // XSDRestriction defines restrictions on a simpleType, simpleContent, or complexContent definition.

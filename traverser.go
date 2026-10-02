@@ -23,25 +23,30 @@ type traverser struct {
 }
 
 func newTraverser(c *XSDSchema, all []*XSDSchema) *traverser {
-	return &traverser{
-		c:   c,
-		all: all,
-		tm:  refResolution, // default traverse mode is refResolution
+	t := &traverser{c: c, all: all}
+	t.tm = refResolution // default traverse mode is refResolution
+	return t
+}
+
+// walkComplexTypes / walkSimpleTypes keep the traversal entrypoints uniform so
+// both traverse() and findNameByType() iterate schemas the same way.
+func (t *traverser) walkComplexTypes(cts []*XSDComplexType) {
+	for i := range cts {
+		t.traverseComplexType(cts[i])
+	}
+}
+
+func (t *traverser) walkSimpleTypes(sts []*XSDSimpleType) {
+	for i := range sts {
+		t.traverseSimpleType(sts[i])
 	}
 }
 
 func (t *traverser) traverse() {
 	t.tm = refResolution
-
-	for _, ct := range t.c.ComplexTypes {
-		t.traverseComplexType(ct)
-	}
-	for _, st := range t.c.SimpleType {
-		t.traverseSimpleType(st)
-	}
-	for _, elm := range t.c.Elements {
-		t.traverseElement(elm)
-	}
+	t.walkComplexTypes(t.c.ComplexTypes)
+	t.walkSimpleTypes(t.c.SimpleType)
+	t.traverseElements(t.c.Elements)
 }
 
 // Given a type, check if there is an Element with that type, and return its name.
@@ -53,27 +58,17 @@ func (t *traverser) traverse() {
 func (t *traverser) findNameByType(name string) string {
 	t.initFindNameByType(name)
 
-	// Search for elements of given type
 	for _, schema := range t.all {
-		for _, elm := range schema.Elements {
-			t.traverseElement(elm)
-		}
-		for _, ct := range schema.ComplexTypes {
-			t.traverseComplexType(ct)
-		}
-		for _, st := range schema.SimpleType {
-			t.traverseSimpleType(st)
-		}
+		t.traverseElements(schema.Elements)
+		t.walkComplexTypes(schema.ComplexTypes)
+		t.walkSimpleTypes(schema.SimpleType)
 	}
 
-	// Return found element name if given type is used only once
-	if len(t.foundElmName) > 0 && !t.conflictingTypeUsage {
-		return t.foundElmName
+	// No element found, or the same type backed conflicting element names.
+	if t.conflictingTypeUsage || len(t.foundElmName) == 0 {
+		return t.typeName
 	}
-
-	// Return original type name
-	// No element found or conflicting element names found
-	return t.typeName
+	return t.foundElmName
 }
 
 func (t *traverser) initFindNameByType(name string) {
@@ -85,63 +80,73 @@ func (t *traverser) initFindNameByType(name string) {
 }
 
 func (t *traverser) traverseElements(ct []*XSDElement) {
-	for _, elm := range ct {
-		t.traverseElement(elm)
+	for i := range ct {
+		t.traverseElement(ct[i])
 	}
 }
 
 func (t *traverser) traverseElement(elm *XSDElement) {
 	t.findElmName(elm)
 
-	if elm.ComplexType != nil {
-		t.traverseComplexType(elm.ComplexType)
+	if st := elm.SimpleType; st != nil {
+		t.traverseSimpleType(st)
 	}
-	if elm.SimpleType != nil {
-		t.traverseSimpleType(elm.SimpleType)
+	if ct := elm.ComplexType; ct != nil {
+		t.traverseComplexType(ct)
 	}
 }
 
 func (t *traverser) findElmName(elm *XSDElement) {
-	// Check if we are called by findNameByType
-	if t.tm != findNameByType {
+	// Only relevant to findNameByType; bail once a conflict is already known.
+	if t.tm != findNameByType || t.conflictingTypeUsage {
+		return
+	}
+	if stripns(elm.Type) != t.typeName {
 		return
 	}
 
-	// Conflicting type usage already detected -> no need to search any further
-	if t.conflictingTypeUsage {
-		return
-	}
-
-	if stripns(elm.Type) == t.typeName {
-		if len(t.foundElmName) == 0 {
-			// First time usage t.typeName
-			t.foundElmName = elm.Name
-		} else if t.foundElmName != elm.Name {
-			// Duplicate use of t.typeName with different element names
-			t.conflictingTypeUsage = true
-		}
+	switch {
+	case len(t.foundElmName) == 0:
+		// First usage of t.typeName.
+		t.foundElmName = elm.Name
+	case t.foundElmName != elm.Name:
+		// Duplicate use of t.typeName with different element names.
+		t.conflictingTypeUsage = true
 	}
 }
 
 func (t *traverser) traverseSimpleType(st *XSDSimpleType) {
+	if st == nil {
+		return
+	}
+	t.resolveUnion(&st.Union)
+	// Resolve the list's item type from its inline simpleType definition.
+	if st.List.ItemType != "" || st.List.SimpleType != nil {
+		st.List.ItemType = stripns(st.List.SimpleType.Restriction.Base)
+	}
 }
 
 func (t *traverser) traverseComplexType(ct *XSDComplexType) {
-	t.traverseElements(ct.Sequence)
-	t.traverseElements(ct.Choice)
-	t.traverseElements(ct.SequenceChoice)
-	t.traverseElements(ct.All)
-	t.traverseAttributes(ct.Attributes)
-	t.traverseAttributes(ct.ComplexContent.Extension.Attributes)
-	t.traverseElements(ct.ComplexContent.Extension.Sequence)
-	t.traverseElements(ct.ComplexContent.Extension.Choice)
-	t.traverseElements(ct.ComplexContent.Extension.SequenceChoice)
-	t.traverseAttributes(ct.SimpleContent.Extension.Attributes)
+	ext := ct.ComplexContent.Extension
+	elementGroups := [][]*XSDElement{
+		ct.Sequence, ct.Choice, ct.SequenceChoice, ct.All,
+		ext.Sequence, ext.Choice, ext.SequenceChoice,
+	}
+	for _, els := range elementGroups {
+		t.traverseElements(els)
+	}
+
+	attributeGroups := [][]*XSDAttribute{
+		ct.Attributes, ext.Attributes, ct.SimpleContent.Extension.Attributes,
+	}
+	for _, attrs := range attributeGroups {
+		t.traverseAttributes(attrs)
+	}
 }
 
 func (t *traverser) traverseAttributes(attrs []*XSDAttribute) {
-	for _, attr := range attrs {
-		t.traverseAttribute(attr)
+	for i := range attrs {
+		t.traverseAttribute(attrs[i])
 	}
 }
 
@@ -153,19 +158,21 @@ func (t *traverser) traverseAttribute(attr *XSDAttribute) {
 
 	if attr.Ref != "" {
 		refAttr := t.getGlobalAttribute(attr.Ref)
-		if refAttr != nil && refAttr.Ref == "" {
-			t.traverseAttribute(refAttr)
-			attr.Name = refAttr.Name
-			attr.Type = refAttr.Type
-			if attr.Fixed == "" {
-				attr.Fixed = refAttr.Fixed
-			}
+		if refAttr == nil || refAttr.Ref != "" {
+			return
 		}
-	} else if attr.Type == "" {
-		if attr.SimpleType != nil {
-			t.traverseSimpleType(attr.SimpleType)
-			attr.Type = attr.SimpleType.Restriction.Base
+		t.traverseAttribute(refAttr)
+		attr.Name = refAttr.Name
+		attr.Type = refAttr.Type
+		if attr.Fixed == "" {
+			attr.Fixed = refAttr.Fixed
 		}
+		return
+	}
+
+	if attr.Type == "" && attr.SimpleType != nil {
+		t.traverseSimpleType(attr.SimpleType)
+		attr.Type = attr.SimpleType.Restriction.Base
 	}
 }
 
@@ -173,11 +180,12 @@ func (t *traverser) getGlobalAttribute(name string) *XSDAttribute {
 	ref := t.qname(name)
 
 	for _, schema := range t.all {
-		if schema.TargetNamespace == ref.Space {
-			for _, attr := range schema.Attributes {
-				if attr.Name == ref.Local {
-					return attr
-				}
+		if schema.TargetNamespace != ref.Space {
+			continue
+		}
+		for _, attr := range schema.Attributes {
+			if attr.Name == ref.Local {
+				return attr
 			}
 		}
 	}
@@ -187,16 +195,36 @@ func (t *traverser) getGlobalAttribute(name string) *XSDAttribute {
 
 // qname resolves QName into xml.Name.
 func (t *traverser) qname(name string) (qname xml.Name) {
-	x := strings.SplitN(name, ":", 2)
-	if len(x) == 1 {
-		qname.Local = x[0]
-	} else {
-		qname.Local = x[1]
-		qname.Space = x[0]
-		if ns, ok := t.c.Xmlns[qname.Space]; ok {
-			qname.Space = ns
-		}
+	parts := strings.SplitN(name, ":", 2)
+	if len(parts) < 2 {
+		qname.Local = parts[0]
+		return qname
 	}
 
+	qname.Space, qname.Local = parts[0], parts[1]
+	if ns, ok := t.c.Xmlns[qname.Space]; ok {
+		qname.Space = ns
+	}
 	return qname
+}
+
+// resolveUnion rewrites a union's member type references down to their bare
+// local names. A union's members come from both the memberTypes attribute and
+// any inline <simpleType> children, so both sources are walked here. memberTypes
+// is whitespace-normalized by the XML decoder, so the parsed fields already line
+// up with the declared members.
+func (t *traverser) resolveUnion(u *XSDUnion) {
+	for _, member := range u.SimpleType {
+		t.traverseSimpleType(member)
+	}
+	if u.MemberTypes == "" {
+		return
+	}
+	members := u.memberNames()
+	normalized := make([]string, 0, len(members))
+	// rewrite each named member to its bare local name
+	for i := range members {
+		normalized = append(normalized, stripns(members[i]))
+	}
+	u.MemberTypes = strings.Join(normalized, " ")
 }

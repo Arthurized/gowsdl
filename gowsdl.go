@@ -104,22 +104,24 @@ func NewGoWSDL(file, pkg string, ignoreTLS bool, exportAllTypes bool) (*GoWSDL, 
 	if pkg == "" {
 		pkg = "myservice"
 	}
-	makePublicFn := func(id string) string { return id }
+	var makePublicFn func(string) string
 	if exportAllTypes {
 		makePublicFn = makePublic
+	} else {
+		makePublicFn = func(id string) string { return id }
 	}
 
-	r, err := ParseLocation(file)
+	loc, err := ParseLocation(file)
 	if err != nil {
 		return nil, err
 	}
 
-	return &GoWSDL{
-		loc:          r,
-		pkg:          pkg,
-		ignoreTLS:    ignoreTLS,
-		makePublicFn: makePublicFn,
-	}, nil
+	wsdl := &GoWSDL{}
+	wsdl.loc = loc
+	wsdl.pkg = pkg
+	wsdl.ignoreTLS = ignoreTLS
+	wsdl.makePublicFn = makePublicFn
+	return wsdl, nil
 }
 
 // Start initiaties the code generation process by starting two goroutines: one
@@ -133,8 +135,11 @@ func (g *GoWSDL) Start() (map[string][]byte, error) {
 	}
 
 	// Process WSDL nodes
-	for _, schema := range g.wsdl.Types.Schemas {
-		newTraverser(schema, g.wsdl.Types.Schemas).traverse()
+	schemas := g.wsdl.Types.Schemas
+	for i := 0; i < len(schemas); i++ {
+		schema := schemas[i]
+		t := newTraverser(schema, schemas)
+		t.traverse()
 	}
 
 	var wg sync.WaitGroup
@@ -193,11 +198,13 @@ func (g *GoWSDL) fetchFile(loc *Location) (data []byte, err error) {
 	if loc.f != "" {
 		log.Println("Reading", "file", loc.f)
 		data, err = ioutil.ReadFile(loc.f)
-	} else {
-		log.Println("Downloading", "file", loc.u.String())
-		data, err = downloadFile(loc.u.String(), g.ignoreTLS)
+		return data, err
 	}
-	return
+
+	remote := loc.u.String()
+	log.Println("Downloading", "file", remote)
+	data, err = downloadFile(remote, g.ignoreTLS)
+	return data, err
 }
 
 func (g *GoWSDL) unmarshal() error {
@@ -206,16 +213,16 @@ func (g *GoWSDL) unmarshal() error {
 		return err
 	}
 
-	g.wsdl = new(WSDL)
-	err = xml.Unmarshal(data, g.wsdl)
-	if err != nil {
+	parsed := new(WSDL)
+	if err := xml.Unmarshal(data, parsed); err != nil {
 		return err
 	}
+	g.wsdl = parsed
 	g.rawWSDL = data
 
-	for _, schema := range g.wsdl.Types.Schemas {
-		err = g.resolveXSDExternals(schema, g.loc)
-		if err != nil {
+	for i := range g.wsdl.Types.Schemas {
+		schema := g.wsdl.Types.Schemas[i]
+		if err := g.resolveXSDExternals(schema, g.loc); err != nil {
 			return err
 		}
 	}
@@ -230,7 +237,7 @@ func (g *GoWSDL) resolveXSDExternals(schema *XSDSchema, loc *Location) error {
 			return err
 		}
 		schemaKey := location.String()
-		if g.resolvedXSDExternals[location.String()] {
+		if g.resolvedXSDExternals[schemaKey] {
 			return nil
 		}
 		if g.resolvedXSDExternals == nil {
@@ -238,30 +245,25 @@ func (g *GoWSDL) resolveXSDExternals(schema *XSDSchema, loc *Location) error {
 		}
 		g.resolvedXSDExternals[schemaKey] = true
 
-		var data []byte
-		if data, err = g.fetchFile(location); err != nil {
-			return err
-		}
-
-		newschema := new(XSDSchema)
-
-		err = xml.Unmarshal(data, newschema)
+		data, err := g.fetchFile(location)
 		if err != nil {
 			return err
 		}
 
-		if (len(newschema.Includes) > 0 || len(newschema.Imports) > 0) &&
-			maxRecursion > g.currentRecursionLevel {
-			g.currentRecursionLevel++
+		newschema := new(XSDSchema)
+		if err := xml.Unmarshal(data, newschema); err != nil {
+			return err
+		}
 
-			err = g.resolveXSDExternals(newschema, location)
-			if err != nil {
+		nested := len(newschema.Includes) > 0 || len(newschema.Imports) > 0
+		if nested && g.currentRecursionLevel < maxRecursion {
+			g.currentRecursionLevel++
+			if err := g.resolveXSDExternals(newschema, location); err != nil {
 				return err
 			}
 		}
 
 		g.wsdl.Types.Schemas = append(g.wsdl.Types.Schemas, newschema)
-
 		return nil
 	}
 
@@ -286,6 +288,17 @@ func (g *GoWSDL) resolveXSDExternals(schema *XSDSchema, loc *Location) error {
 	return nil
 }
 
+// renderTemplate parses text as a named template with the given helpers and
+// executes it against data, returning the rendered bytes.
+func renderTemplate(name, text string, funcs template.FuncMap, data interface{}) ([]byte, error) {
+	var out bytes.Buffer
+	tmpl := template.Must(template.New(name).Funcs(funcs).Parse(text))
+	if err := tmpl.Execute(&out, data); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
 func (g *GoWSDL) genTypes() ([]byte, error) {
 	funcMap := template.FuncMap{
 		"toGoType":                 toGoType,
@@ -304,14 +317,7 @@ func (g *GoWSDL) genTypes() ([]byte, error) {
 		"getNS":                    g.getNS,
 	}
 
-	data := new(bytes.Buffer)
-	tmpl := template.Must(template.New("types").Funcs(funcMap).Parse(typesTmpl))
-	err := tmpl.Execute(data, g.wsdl.Types)
-	if err != nil {
-		return nil, err
-	}
-
-	return data.Bytes(), nil
+	return renderTemplate("types", typesTmpl, funcMap, g.wsdl.Types)
 }
 
 func (g *GoWSDL) genOperations() ([]byte, error) {
@@ -327,14 +333,7 @@ func (g *GoWSDL) genOperations() ([]byte, error) {
 		"findServiceAddress":   g.findServiceAddress,
 	}
 
-	data := new(bytes.Buffer)
-	tmpl := template.Must(template.New("operations").Funcs(funcMap).Parse(opsTmpl))
-	err := tmpl.Execute(data, g.wsdl.PortTypes)
-	if err != nil {
-		return nil, err
-	}
-
-	return data.Bytes(), nil
+	return renderTemplate("operations", opsTmpl, funcMap, g.wsdl.PortTypes)
 }
 
 func (g *GoWSDL) genServer() ([]byte, error) {
@@ -348,14 +347,7 @@ func (g *GoWSDL) genServer() ([]byte, error) {
 		"findServiceAddress":   g.findServiceAddress,
 	}
 
-	data := new(bytes.Buffer)
-	tmpl := template.Must(template.New("server").Funcs(funcMap).Parse(serverTmpl))
-	err := tmpl.Execute(data, g.wsdl.PortTypes)
-	if err != nil {
-		return nil, err
-	}
-
-	return data.Bytes(), nil
+	return renderTemplate("server", serverTmpl, funcMap, g.wsdl.PortTypes)
 }
 
 func (g *GoWSDL) genHeader() ([]byte, error) {
@@ -369,14 +361,7 @@ func (g *GoWSDL) genHeader() ([]byte, error) {
 		"comment":              comment,
 	}
 
-	data := new(bytes.Buffer)
-	tmpl := template.Must(template.New("header").Funcs(funcMap).Parse(headerTmpl))
-	err := tmpl.Execute(data, g.pkg)
-	if err != nil {
-		return nil, err
-	}
-
-	return data.Bytes(), nil
+	return renderTemplate("header", headerTmpl, funcMap, g.pkg)
 }
 
 func (g *GoWSDL) genServerHeader() ([]byte, error) {
@@ -389,14 +374,7 @@ func (g *GoWSDL) genServerHeader() ([]byte, error) {
 		"comment":              comment,
 	}
 
-	data := new(bytes.Buffer)
-	tmpl := template.Must(template.New("server_header").Funcs(funcMap).Parse(serverHeaderTmpl))
-	err := tmpl.Execute(data, g.pkg)
-	if err != nil {
-		return nil, err
-	}
-
-	return data.Bytes(), nil
+	return renderTemplate("server_header", serverHeaderTmpl, funcMap, g.pkg)
 }
 
 var reservedWords = map[string]string{
@@ -463,43 +441,53 @@ var specialCharacterMapping = map[string]string{
 
 // Replaces Go reserved keywords to avoid compilation issues
 func replaceReservedWords(identifier string) string {
-	value := reservedWords[identifier]
-	if value != "" {
-		return value
+	if sanitized := reservedWords[identifier]; sanitized != "" {
+		return sanitized
 	}
 	return normalize(identifier)
 }
 
 // Replaces Go reserved keywords to avoid compilation issues
 func replaceAttrReservedWords(identifier string) string {
-	value := reservedWordsInAttr[identifier]
-	if value != "" {
-		return value
+	if sanitized := reservedWordsInAttr[identifier]; sanitized != "" {
+		return sanitized
 	}
 	return normalize(identifier)
 }
 
 // Normalizes value to be used as a valid Go identifier, avoiding compilation issues
 func normalize(value string) string {
-	for k, v := range specialCharacterMapping {
-		value = strings.ReplaceAll(value, k, v)
+	v := value
+	for k, rep := range specialCharacterMapping {
+		if strings.Contains(v, k) {
+			v = strings.ReplaceAll(v, k, rep)
+		}
 	}
 
-	mapping := func(r rune) rune {
+	out := make([]rune, 0, len(v))
+	for _, r := range v {
 		if r == '.' || r == '-' {
-			return '_'
+			r = '_'
 		}
-		if unicode.IsLetter(r) || unicode.IsDigit(r) || r == '_' {
-			return r
+		keep := false
+		if r == '_' {
+			keep = true
+		} else if unicode.IsLetter(r) {
+			keep = true
+		} else if unicode.IsDigit(r) {
+			keep = true
 		}
-		return -1
+		if keep {
+			out = append(out, r)
+		}
 	}
-
-	return strings.Map(mapping, value)
+	return string(out)
 }
 
 func goString(s string) string {
-	return strings.ReplaceAll(s, "\"", "\\\"")
+	escaped := s
+	escaped = strings.ReplaceAll(escaped, "\"", "\\\"")
+	return escaped
 }
 
 var xsd2GoTypes = map[string]string{
@@ -529,37 +517,36 @@ var xsd2GoTypes = map[string]string{
 	"anyuri":             "AnyURI",
 }
 
-func removeNS(xsdType string) string {
-	// Handles name space, ie. xsd:string, xs:string
-	r := strings.Split(xsdType, ":")
-
-	if len(r) == 2 {
-		return r[1]
+// localPart drops an optional "ns:" prefix from a qualified name
+// (ie. xsd:string, xs:string) and returns the bare local name.
+func localPart(qname string) string {
+	parts := strings.Split(qname, ":")
+	if len(parts) == 2 {
+		return parts[1]
 	}
+	return parts[0]
+}
 
-	return r[0]
+func removeNS(xsdType string) string {
+	return localPart(xsdType)
 }
 
 func toGoType(xsdType string, nillable bool) string {
-	// Handles name space, ie. xsd:string, xs:string
-	r := strings.Split(xsdType, ":")
+	local := localPart(xsdType)
+	key := strings.ToLower(local)
 
-	t := r[0]
-
-	if len(r) == 2 {
-		t = r[1]
-	}
-
-	value := xsd2GoTypes[strings.ToLower(t)]
-
-	if value != "" {
+	mapped, ok := xsd2GoTypes[key]
+	if ok && mapped != "" {
+		goType := mapped
 		if nillable {
-			value = "*" + value
+			goType = "*" + goType
 		}
-		return value
+		return goType
 	}
 
-	return "*" + replaceReservedWords(makePublic(t))
+	custom := makePublic(local)
+	custom = replaceReservedWords(custom)
+	return "*" + custom
 }
 
 func removePointerFromType(goType string) string {
@@ -592,18 +579,23 @@ func (g *GoWSDL) findType(message string) string {
 		if part.Type != "" {
 			return stripns(part.Type)
 		}
+		return g.resolveElementRef(stripns(part.Element))
+	}
+	return ""
+}
 
-		elRef := stripns(part.Element)
-
-		for _, schema := range g.wsdl.Types.Schemas {
-			for _, el := range schema.Elements {
-				if strings.EqualFold(elRef, el.Name) {
-					if el.Type != "" {
-						return stripns(el.Type)
-					}
-					return el.Name
-				}
+// resolveElementRef maps a document/literal element reference to its Go type
+// name, falling back to the element name, or "" when no element matches.
+func (g *GoWSDL) resolveElementRef(ref string) string {
+	for _, schema := range g.wsdl.Types.Schemas {
+		for _, el := range schema.Elements {
+			if !strings.EqualFold(ref, el.Name) {
+				continue
 			}
+			if el.Type != "" {
+				return stripns(el.Type)
+			}
+			return el.Name
 		}
 	}
 	return ""
@@ -618,14 +610,15 @@ func (g *GoWSDL) findNameByType(name string) string {
 // TODO(c4milo): improve runtime complexity if performance turns out to be an issue.
 func (g *GoWSDL) findSOAPAction(operation, portType string) string {
 	for _, binding := range g.wsdl.Binding {
-		if strings.ToUpper(stripns(binding.Type)) != strings.ToUpper(portType) {
+		if !strings.EqualFold(stripns(binding.Type), portType) {
 			continue
 		}
 
 		for _, soapOp := range binding.Operations {
-			if soapOp.Name == operation {
-				return soapOp.SOAPOperation.SOAPAction
+			if soapOp.Name != operation {
+				continue
 			}
+			return soapOp.SOAPOperation.SOAPAction
 		}
 	}
 	return ""
@@ -634,9 +627,10 @@ func (g *GoWSDL) findSOAPAction(operation, portType string) string {
 func (g *GoWSDL) findServiceAddress(name string) string {
 	for _, service := range g.wsdl.Service {
 		for _, port := range service.Ports {
-			if port.Name == name {
-				return port.SOAPAddress.Location
+			if port.Name != name {
+				continue
 			}
+			return port.SOAPAddress.Location
 		}
 	}
 	return ""
@@ -644,30 +638,18 @@ func (g *GoWSDL) findServiceAddress(name string) string {
 
 // TODO(c4milo): Add namespace support instead of stripping it
 func stripns(xsdType string) string {
-	r := strings.Split(xsdType, ":")
-	t := r[0]
-
-	if len(r) == 2 {
-		t = r[1]
-	}
-
-	return t
+	return localPart(xsdType)
 }
 
 func makePublic(identifier string) string {
 	if isBasicType(identifier) {
 		return identifier
 	}
-	if identifier == "" {
+	runes := []rune(identifier)
+	if len(runes) == 0 {
 		return "EmptyString"
 	}
-	field := []rune(identifier)
-	if len(field) == 0 {
-		return identifier
-	}
-
-	field[0] = unicode.ToUpper(field[0])
-	return string(field)
+	return string(unicode.ToUpper(runes[0])) + string(runes[1:])
 }
 
 var basicTypes = map[string]string{
@@ -690,44 +672,38 @@ var basicTypes = map[string]string{
 }
 
 func isBasicType(identifier string) bool {
-	if _, exists := basicTypes[identifier]; exists {
-		return true
-	}
-	return false
+	_, ok := basicTypes[identifier]
+	return ok
 }
 
 func makePrivate(identifier string) string {
-	field := []rune(identifier)
-	if len(field) == 0 {
+	runes := []rune(identifier)
+	if len(runes) == 0 {
 		return identifier
 	}
-
-	field[0] = unicode.ToLower(field[0])
-	return string(field)
+	return string(unicode.ToLower(runes[0])) + string(runes[1:])
 }
 
 func comment(text string) string {
 	lines := strings.Split(text, "\n")
-
-	var output string
 	if len(lines) == 1 && lines[0] == "" {
 		return ""
 	}
 
 	// Helps to determine if there is an actual comment without screwing newlines
 	// in real comments.
+	var output strings.Builder
 	hasComment := false
-
 	for _, line := range lines {
 		line = strings.TrimLeftFunc(line, unicode.IsSpace)
 		if line != "" {
 			hasComment = true
 		}
-		output += "\n// " + line
+		output.WriteString("\n// " + line)
 	}
 
-	if hasComment {
-		return output
+	if !hasComment {
+		return ""
 	}
-	return ""
+	return output.String()
 }

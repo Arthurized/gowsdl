@@ -114,48 +114,36 @@ func main() {
 		log.Fatalln(err)
 	}
 
-	pkg := filepath.Join(*dir, *pkg)
-	err = os.Mkdir(pkg, 0744)
+	pkgDir := filepath.Join(*dir, *pkg)
+	err = os.Mkdir(pkgDir, 0744)
 
-	file, err := os.Create(filepath.Join(pkg, *outFile))
+	writeGenerated(filepath.Join(pkgDir, *outFile),
+		gocode["header"], gocode["types"], gocode["operations"], gocode["soap"])
+	writeGenerated(pkgDir+"/"+"server"+*outFile,
+		gocode["server_header"], gocode["server_wsdl"], gocode["server"])
+
+	log.Println("Done 👍")
+}
+
+// writeGenerated concatenates the generated chunks, gofmt's the result, and
+// writes it to path. On a formatting error the raw (trusted) bytes are still
+// written so the partial output can be inspected.
+func writeGenerated(path string, chunks ...[]byte) {
+	file, err := os.Create(path)
 	if err != nil {
 		log.Fatalln(err)
 	}
 	defer file.Close()
 
 	data := new(bytes.Buffer)
-	data.Write(gocode["header"])
-	data.Write(gocode["types"])
-	data.Write(gocode["operations"])
-	data.Write(gocode["soap"])
+	for _, chunk := range chunks {
+		data.Write(chunk)
+	}
 
-	// go fmt the generated code
 	source, err := format.Source(data.Bytes())
 	if err != nil {
 		file.Write(data.Bytes())
 		log.Fatalln(err)
 	}
-
 	file.Write(source)
-
-	// server
-	serverFile, err := os.Create(pkg + "/" + "server" + *outFile)
-	if err != nil {
-		log.Fatalln(err)
-	}
-	defer serverFile.Close()
-
-	serverData := new(bytes.Buffer)
-	serverData.Write(gocode["server_header"])
-	serverData.Write(gocode["server_wsdl"])
-	serverData.Write(gocode["server"])
-
-	serverSource, err := format.Source(serverData.Bytes())
-	if err != nil {
-		serverFile.Write(serverData.Bytes())
-		log.Fatalln(err)
-	}
-	serverFile.Write(serverSource)
-
-	log.Println("Done 👍")
 }
